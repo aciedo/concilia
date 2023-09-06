@@ -63,7 +63,11 @@ async fn main() -> Result<(), Error> {
     // SERVER
     // validate blind signature
     let ballot_id = BallotID::new(&ballot);
-    Signature::from(ballot.sig).verify(&vote_pk, blinding_result.msg_randomizer, claim_token, &options)?;
+    if let Ok(_) = Signature::from(ballot.sig).verify(&vote_pk, blinding_result.msg_randomizer, claim_token, &options) {
+        println!("blind signature verified");
+    } else {
+        panic!("blind signature invalid");
+    }
     let kt2_sig = secret.sign(&ballot_id.0);
     let stored_ballot = StoredBallot::new(ballot.opt, kt2_sig);
     
