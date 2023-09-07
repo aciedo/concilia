@@ -44,6 +44,7 @@ async fn main() -> Result<(), Error> {
     let flush_notification = FLUSH_NOTIFY.clone();
 
     let Keypair { secret, public } = Keypair::generate(None);
+    info!("Server D3 public key fingerprint {}", bs58::encode(hash(&public.bytes).as_bytes()).into_string());
     let options = Options::default();
 
     // 1. Create vote on SERVER
@@ -88,7 +89,7 @@ async fn main() -> Result<(), Error> {
         &vote_id,
     )
     .unwrap();
-    info!("VOTER created ballot");
+    info!("VOTER created unblinded ballot");
     // ballot -> SERVER
 
     // SERVER
