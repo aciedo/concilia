@@ -526,6 +526,7 @@ dependencies = [
  "actix-web",
  "blake3",
  "blind-rsa-signatures",
+ "bs58",
  "derive_more",
  "hashbrown 0.14.0",
  "kt2",

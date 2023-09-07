@@ -1,7 +1,7 @@
 #![feature(lazy_cell)]
 use std::{
     io,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock}, ops::Deref, fmt::{Display, Formatter},
 };
 
 use blake3::{hash, Hasher};
@@ -13,10 +13,15 @@ use blind_rsa_signatures::{
     BlindSignature, BlindingResult, KeyPair, Options, PublicKey as RsaPublicKey,
     SecretKey as RsaSecretKey, Signature,
 };
-use kt2::{SIGN_BYTES, Keypair};
-use rkyv::{archived_root, to_bytes, Archive, Deserialize, Serialize};
+use hashbrown::HashMap;
+use kt2::{Keypair, SIGN_BYTES};
+use rkyv::{archived_root, from_bytes, to_bytes, Archive, Deserialize, Serialize};
 use sled::{Db, InlineArray};
-use tokio::sync::Notify;
+use tokio::{
+    sync::Notify,
+    task::{spawn_blocking, JoinError},
+};
+use tracing::{debug, info};
 
 // 1. Create vote
 // 2. Voter authenticates themselves to receive a blinded signature signed by vote's secret key
@@ -29,55 +34,160 @@ use tokio::sync::Notify;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt::init();
     let db = sled::Config::default()
         .flush_every_ms(None)
         .path("concilia.db")
         .open()?;
-    println!("db opened");
     let rng = &mut rand::thread_rng();
     Flusher::new(FLUSH_NOTIFY.clone()).start(db.clone());
-    
+    let flush_notification = FLUSH_NOTIFY.clone();
+
     let Keypair { secret, public } = Keypair::generate(None);
+    let options = Options::default();
 
     // 1. Create vote on SERVER
     let (sk, vote) = Vote::new(vec!["Bob".to_string()]).unwrap();
-    store_vote(&vote, &db).await?;
-    println!("created vote");
+    let vote_id = store_vote(&vote, &db)?;
+    store_vote_sk(&sk, &vote_id, &db)?;
+    flush_notification.notified().await;
+    info!("SERVER vote created: {}", &vote_id);
 
     // 2. VOTER authenticates themselves to receive a blinded signature signed by vote's secret key
     // This would usually include some sort of ID check
+    let vote_id = VoteID::new(&vote);
     let claim_token = b"1234";
-    let options = Options::default();
     let vote_pk = RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(&vote.pk).unwrap());
     let blinding_result = vote_pk.blind(rng, claim_token, true, &options)?;
+    let blind_msg = blinding_result.blind_msg.clone();
+    info!("VOTER created blind msg: {}", bs58::encode(&blind_msg).into_string());
+    // blind_msg -> SERVER
 
     // SERVER validates some sort of proof and then signs the blinded message
-    let sig = sk.blind_sign(rng, &blinding_result.blind_msg, &options)?;
+    // SERVER CANNOT see claim_token when signing it
+    info!("SERVER loading vote blinding secret key");
+    let sk = maybe_read_vote_sk(&vote_id, db.clone())
+        .await?
+        .ok_or(Error::VoteNotFound)?;
+    let sig = sk.blind_sign(rng, &blind_msg, &options)?;
     let token = BallotToken::new(sig);
+    info!("SERVER issued ballot token: {}", bs58::encode(&token.blinded_sig).into_string());
+    // token -> VOTER
 
     // 3. Voter unblinds the token into a signature
     // VOTER
+    info!("VOTER unblinding ballot token");
     let opt = "Bob".to_string();
-    let ballot = Ballot::from_token(token, opt, &blinding_result, claim_token, &options, &vote.pk).unwrap();
-    
+    let mut ballot = Ballot::from_token(
+        token,
+        opt,
+        &blinding_result,
+        claim_token,
+        &options,
+        &vote_pk,
+        &vote_id,
+    )
+    .unwrap();
+    info!("VOTER created ballot");
+    // ballot -> SERVER
+
     // SERVER
     // validate blind signature
+    let vote_bytes = maybe_read_vote(&vote_id, db.clone())
+        .await?
+        .ok_or(Error::VoteNotFound)?;
+    let vote = unsafe { archived_root::<Vote>(&vote_bytes[..]) };
     let ballot_id = BallotID::new(&ballot);
-    if let Ok(_) = Signature::from(ballot.sig).verify(&vote_pk, blinding_result.msg_randomizer, claim_token, &options) {
-        println!("blind signature verified");
-    } else {
-        panic!("blind signature invalid");
-    }
-    let kt2_sig = secret.sign(&ballot_id.0);
-    let stored_ballot = StoredBallot::new(ballot.opt, kt2_sig);
+    let pk = RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(&vote.pk).unwrap());
+    info!("SERVER validating blind signature");
     
-    println!("loading ballot");
-    let maybe_ballot = read_maybe_ballot(&ballot_id, &db)?;
-    if let Some(bytes) = maybe_ballot {
-        let archived_ballot = unsafe { archived_root::<Ballot>(&bytes[..]) };
-        println!("opt: {}", archived_ballot.opt);
+    let sig = if let BallotSig::Blind(sig) = ballot.sig {
+        sig
+    } else {
+        return Err(Error::BallotWrongSigType {
+            expected: BallotSig::Blind(vec![]),
+            got: ballot.sig,
+        });
+    };
+    Signature::from(sig).verify(
+        &pk,
+        blinding_result.msg_randomizer,
+        claim_token,
+        &options,
+    )?;
+    info!("SERVER blind signature valid");
+
+    // this is your "vote counted" receipt
+    // we replace the blind sig with a D3 sig because PQ blind sigs are huge (22kb each) so we don't bother storing them
+    let kt2_sig = secret.sign(&ballot_id.0);
+    ballot.sig = BallotSig::D3(kt2_sig.0);
+    store_ballot(&ballot, &ballot_id, &db)?;
+    apply_ballot(&vote_id, &ballot, db.clone())?;
+    flush_notification.notified().await;
+    // (ballot_id, kt2_sig) -> VOTER
+    info!("SERVER counted ballot");
+
+    info!("VOTER ballot id {}", ballot_id);
+    info!("VOTER validating vote receipt");
+    if public.verify(ballot_id.as_ref(), &kt2_sig) {
+        info!("VOTER vote receipt valid");
+    } else {
+        info!("VOTER vote receipt invalid");
     }
 
+    Ok(())
+}
+
+fn apply_ballot(vote_id: &VoteID, ballot: &Ballot, db: Db) -> Result<(), Error> {
+    let key = [b"vote_", vote_id.as_ref()].concat();
+    debug!("applying ballot to {}", &vote_id);
+    db.update_and_fetch(key, |old| match old {
+        Some(old) => {
+            let mut vote = from_bytes::<Vote>(old).unwrap();
+            *vote.options.get_mut(&ballot.opt)? += 1;
+            Some(to_bytes::<_, 512>(&vote).unwrap().into_vec())
+        }
+        None => None,
+    })?;
+    Ok(())
+}
+
+fn store_vote_sk(sk: &RsaSecretKey, vote_id: &VoteID, db: &Db) -> Result<(), Error> {
+    let sk = sk.to_der().unwrap();
+    let key = [b"sk_vote_", vote_id.as_ref()].concat();
+    db.insert(key, sk)?;
+    Ok(())
+}
+
+async fn maybe_read_vote_sk(vote_id: &VoteID, db: Db) -> Result<Option<RsaSecretKey>, Error> {
+    let key = [b"sk_vote_", vote_id.as_ref()].concat();
+    spawn_blocking(move || {
+        let sk = db
+            .get(key)?
+            .map(|bytes| RsaSecretKey::from_der(&bytes).unwrap());
+        Ok(sk)
+    })
+    .await?
+}
+
+fn store_vote(vote: &Vote, db: &Db) -> Result<VoteID, Error> {
+    let vote_id = VoteID::new(vote);
+    let key = [b"vote_", vote_id.as_ref()].concat();
+    let value = to_bytes::<_, 512>(vote).map_err(|_| Error::SerializationError)?;
+    db.insert(key, value.as_ref())?;
+    Ok(vote_id)
+}
+
+async fn maybe_read_vote(vote_id: &VoteID, db: Db) -> Result<Option<InlineArray>, Error> {
+    let key = [b"vote_", vote_id.as_ref()].concat();
+    spawn_blocking(move || Ok(db.get(key)?)).await?
+}
+
+fn store_ballot(ballot: &Ballot, ballot_id: &BallotID, db: &Db) -> Result<(), Error> {
+    let key = [b"ballot_", ballot_id.as_ref()].concat();
+    let value = to_bytes::<_, 512>(ballot).map_err(|_| Error::SerializationError)?;
+    debug!("storing ballot {}", &ballot_id);
+    db.insert(key, value.as_ref())?;
     Ok(())
 }
 
@@ -110,6 +220,12 @@ enum Error {
     SerializationError,
     IoError(io::Error),
     BlindRsaError(blind_rsa_signatures::Error),
+    VoteNotFound,
+    TaskError(JoinError),
+    BallotWrongSigType {
+        expected: BallotSig,
+        got: BallotSig,
+    }
 }
 
 impl From<io::Error> for Error {
@@ -124,7 +240,14 @@ impl From<blind_rsa_signatures::Error> for Error {
     }
 }
 
-#[derive(Clone, Copy)]
+impl From<JoinError> for Error {
+    fn from(e: JoinError) -> Self {
+        Error::TaskError(e)
+    }
+}
+
+#[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
 struct VoteID {
     hash: [u8; 32],
 }
@@ -137,25 +260,23 @@ impl VoteID {
     }
 }
 
+impl Display for VoteID {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", bs58::encode(&self.hash).into_string())
+    }
+}
+
 impl AsRef<[u8]> for VoteID {
     fn as_ref(&self) -> &[u8] {
         &self.hash
     }
 }
 
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
 struct Vote {
-    options: Vec<String>,
+    options: HashMap<String, u64>,
     pk: Vec<u8>,
-}
-
-async fn store_vote(vote: &Vote, db: &Db) -> Result<VoteID, Error> {
-    let notify = FLUSH_NOTIFY.clone();
-    let key = VoteID::new(&vote);
-    let value = to_bytes::<_, 512>(vote).map_err(|_| Error::SerializationError)?;
-    db.insert(key.clone(), value.as_slice())?;
-    notify.notified().await;
-    Ok(key)
 }
 
 impl Vote {
@@ -164,7 +285,7 @@ impl Vote {
         Ok((
             sk,
             Vote {
-                options,
+                options: options.into_iter().map(|opt| (opt, 0)).collect(),
                 pk: pk.to_public_key_der().unwrap().into_vec(),
             },
         ))
@@ -172,6 +293,7 @@ impl Vote {
 }
 
 #[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 struct BallotToken {
     blinded_sig: Vec<u8>,
 }
@@ -182,40 +304,30 @@ impl BallotToken {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize)]
-struct StoredBallot {
-    opt: String,
-    vote_accepted_sig: [u8; SIGN_BYTES]
+#[derive(Archive, Serialize, Deserialize, Debug)]
+#[archive(check_bytes)]
+enum BallotSig {
+    D3([u8; SIGN_BYTES]),
+    Blind(Vec<u8>),
 }
 
-impl StoredBallot {
-    fn new(opt: String, sig: kt2::Signature) -> Self {
-        StoredBallot {
-            opt,
-            vote_accepted_sig: sig.0,
+impl Deref for BallotSig {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            BallotSig::D3(sig) => sig,
+            BallotSig::Blind(sig) => sig,
         }
     }
 }
 
 #[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 struct Ballot {
-    vote_pk: Vec<u8>,
+    vote_id: VoteID,
     opt: String,
-    sig: Vec<u8>,
-}
-
-/// Stores a ballot in sled, wait for disk flush to complete asynchronously, and then returns the ballot ID
-async fn store_ballot(ballot: &Ballot, db: &Db) -> Result<BallotID, Error> {
-    let notify = FLUSH_NOTIFY.clone();
-    let key = BallotID::new(&ballot);
-    let value = to_bytes::<_, 512>(ballot).map_err(|_| Error::SerializationError)?;
-    db.insert(key.clone(), value.as_slice())?;
-    notify.notified().await;
-    Ok(key)
-}
-
-fn read_maybe_ballot(id: &BallotID, db: &Db) -> Result<Option<InlineArray>, Error> {
-    Ok(db.get(id.as_ref())?)
+    sig: BallotSig,
 }
 
 impl Ballot {
@@ -225,11 +337,9 @@ impl Ballot {
         blinding_result: &BlindingResult,
         claim_token: &[u8],
         options: &Options,
-        vote_pk: &[u8],
+        pk: &RsaPublicKey,
+        vote_id: &VoteID,
     ) -> Result<Self, Error> {
-        let pk =
-            RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(vote_pk).unwrap());
-
         let sig = pk.finalize(
             &token.blinded_sig.into(),
             &blinding_result.secret,
@@ -239,14 +349,15 @@ impl Ballot {
         )?;
 
         Ok(Ballot {
-            vote_pk: vote_pk.into(),
+            vote_id: vote_id.clone(),
             opt,
-            sig: sig.into(),
+            sig: BallotSig::Blind(sig.into()),
         })
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 struct BallotID([u8; 32]);
 
 impl AsRef<[u8]> for BallotID {
@@ -261,5 +372,11 @@ impl BallotID {
         hasher.update(vote.opt.as_bytes());
         hasher.update(&vote.sig);
         BallotID(*hasher.finalize().as_bytes())
+    }
+}
+
+impl Display for BallotID {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", bs58::encode(&self.0).into_string())
     }
 }
