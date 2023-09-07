@@ -533,6 +533,7 @@ dependencies = [
  "num-bigint-dig",
  "rand 0.8.5",
  "rkyv",
+ "serde",
  "sled",
  "tokio",
  "tracing",
@@ -958,6 +959,7 @@ dependencies = [
  "ahash 0.8.3",
  "allocator-api2",
  "rkyv",
+ "serde",
 ]
 
 [[package]]
