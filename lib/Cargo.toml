@@ -1,0 +1,15 @@
+[package]
+name = "concilia"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+blind-rsa-signatures = "0.15.0"
+concilia-shared = { path = "../shared" }
+rand = "0.8.5"
+tracing = "0.1.37"
+bs58 = "0.5.0"
+reqwest = { version = "0.11.20", features = ["json", "rustls-tls-native-roots", "gzip", "deflate", "brotli"] }
+kt2 = "1.0.0"

@@ -6,11 +6,12 @@ use sled::{Db, InlineArray};
 use tokio::{task::spawn_blocking, sync::Notify};
 use tracing::debug;
 
-use crate::shared::{VoteID, Ballot, Error, Vote, BallotID};
+use concilia_shared::{VoteID, Ballot, Error, Vote, BallotID};
 
 pub fn store_vote_sk(sk: &RsaSecretKey, vote_id: &VoteID, db: &Db) -> Result<(), Error> {
     let sk = sk.to_der().unwrap();
     let key = [b"sk_vote_", vote_id.as_ref()].concat();
+    debug!("storing vote sk, size {}", sk.len());
     db.insert(key, sk)?;
     Ok(())
 }
@@ -30,6 +31,7 @@ pub fn store_vote(vote: &Vote, db: &Db) -> Result<VoteID, Error> {
     let vote_id = VoteID::new(vote);
     let key = [b"vote_", vote_id.as_ref()].concat();
     let value = to_bytes::<_, 512>(vote).map_err(|_| Error::SerializationError)?;
+    debug!("storing vote {}, size {}", &vote_id, value.len());
     db.insert(key, value.as_ref())?;
     Ok(vote_id)
 }
@@ -39,12 +41,21 @@ pub async fn maybe_read_vote(vote_id: &VoteID, db: Db) -> Result<Option<InlineAr
     spawn_blocking(move || Ok(db.get(key)?)).await?
 }
 
-pub fn store_ballot(ballot: &Ballot, ballot_id: &BallotID, db: &Db) -> Result<(), Error> {
-    let key = [b"ballot_", ballot_id.as_ref()].concat();
+pub fn store_ballot(ballot: &Ballot, ballot_id: &BallotID, vote_id: &VoteID, db: &Db) -> Result<(), Error> {
+    let key = [vote_id.hash.as_ref(), b"_ballot_", ballot_id.as_ref()].concat();
     let value = to_bytes::<_, 512>(ballot).map_err(|_| Error::SerializationError)?;
-    debug!("storing ballot {}", &ballot_id);
+    debug!("storing ballot {}, size {}", &ballot_id, value.len());
     db.insert(key, value.as_ref())?;
     Ok(())
+}
+
+pub async fn maybe_read_ballot(
+    vote_id: &VoteID,
+    ballot_id: &BallotID,
+    db: Db,
+) -> Result<Option<InlineArray>, Error> {
+    let key = [vote_id.hash.as_ref(), b"_ballot_", ballot_id.as_ref()].concat();
+    spawn_blocking(move || Ok(db.get(key)?)).await?
 }
 
 pub fn apply_ballot(vote_id: &VoteID, ballot: &Ballot, db: Db) -> Result<(), Error> {
@@ -53,7 +64,7 @@ pub fn apply_ballot(vote_id: &VoteID, ballot: &Ballot, db: Db) -> Result<(), Err
     db.update_and_fetch(key, |old| match old {
         Some(old) => {
             let mut vote = from_bytes::<Vote>(old).unwrap();
-            *vote.options.get_mut(&ballot.opt)? += 1;
+            *vote.opts.get_mut(&ballot.opt)? += 1;
             Some(to_bytes::<_, 512>(&vote).unwrap().into_vec())
         }
         None => None,
@@ -61,7 +72,7 @@ pub fn apply_ballot(vote_id: &VoteID, ballot: &Ballot, db: Db) -> Result<(), Err
     Ok(())
 }
 
-pub static FLUSH_NOTIFY: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::const_new()));
+pub static CHECKPOINT: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::const_new()));
 
 pub struct Flusher {
     notify: Arc<Notify>,

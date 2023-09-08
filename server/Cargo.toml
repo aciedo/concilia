@@ -1,0 +1,25 @@
+[package]
+name = "concilia-server"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web = { version = "4.4.0", features = ["rustls"] }
+blake3 = { version = "1.4.1", features = ["rayon"] }
+blind-rsa-signatures = "0.15.0"
+bs58 = "0.5.0"
+derive_more = "0.99.17"
+hashbrown = { version = "0.14.0", features = ["rkyv", "serde"] }
+kt2 = "1.0.0"
+num-bigint-dig = "0.8.4"
+rand = "0.8.5"
+rkyv = { version = "0.7.42", features = ["copy", "validation"] }
+serde = { version = "1.0.188", features = ["derive"] }
+sled = "1.0.0-alpha.117"
+tokio = { version = "1.32.0", features = ["full"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
+concilia-shared = { path = "../shared" }
+futures-util = "0.3.28"
