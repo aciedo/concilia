@@ -1,6 +1,6 @@
 use std::{fmt::{Formatter, Display, self}, ops::Deref};
 
-use blake3::Hasher;
+use blake3::hash;
 use blind_rsa_signatures::{BlindSignature, BlindingResult, Options, PublicKey as RsaPublicKey};
 use rkyv::{Archive, Serialize, Deserialize};
 use serde::{Serialize as Ser, Deserialize as De, de::{Visitor, self}};
@@ -114,7 +114,7 @@ impl Ballot {
         token: BallotToken,
         opt: String,
         blinding_result: &BlindingResult,
-        claim_token: &[u8],
+        claim_token: &[u8; 32],
         options: &Options,
         pk: &RsaPublicKey,
     ) -> Result<Self, Error> {
@@ -145,10 +145,7 @@ impl AsRef<[u8]> for BallotID {
 
 impl BallotID {
     pub fn new(vote: &Ballot) -> Self {
-        let mut hasher = Hasher::new();
-        hasher.update(vote.opt.as_bytes());
-        hasher.update(&vote.sig);
-        BallotID(*hasher.finalize().as_bytes())
+        BallotID(*hash(&[vote.opt.as_bytes(), &vote.sig].concat()).as_bytes())
     }
 }
 

@@ -1,24 +1,26 @@
 #![feature(lazy_cell)]
 #![feature(iter_advance_by)]
-use std::sync::Arc;
-
 use actix_web::{web, App, HttpServer};
 use blake3::hash;
 use concilia_shared::Error;
 use kt2::Keypair;
+use rkyv::{to_bytes, from_bytes};
 use sled::Db;
 use tokio::sync::{
     mpsc::{self, error::TryRecvError},
-    oneshot,
+    oneshot, RwLock,
 };
 use tracing::info;
 
+mod cuckoo;
 mod db;
 mod handlers;
 
 use db::*;
 
 use handlers::*;
+
+use crate::cuckoo::{ScalableCuckooFilter, PartialScalableCuckooFilter, CuckooFilter};
 
 // 1. Create vote
 // 2. Voter authenticates themselves to receive a blinded signature signed by vote's secret key
@@ -97,14 +99,43 @@ async fn main() -> Result<(), Error> {
             }
         }
     });
-    let secret = Arc::new(secret);
-    let public = Arc::new(public);
-    let db_getter = DbGetter(db_tx);
+    let secret = web::Data::new(secret);
+    let public = web::Data::new(public);
+    let db_getter = web::Data::new(DbGetter(db_tx));
+
+    let db = db_getter.get().await;
+    
+    let filter = match db.get(b"FILTER")? {
+        Some(partial) => {
+            let partial: PartialScalableCuckooFilter<[u8; 32]> = from_bytes(&partial).map_err(|_| Error::SerializationError)?;
+            // search db for the individual filters
+            let individual_filters = db.scan_prefix(b"cuckoo_filter_").into_iter().map(|a| {
+                let (_, value) = a.unwrap();
+                // sled's iterators are big endian so thesse are already in the right order
+                from_bytes::<CuckooFilter>(&value).unwrap()
+            }).collect::<Vec<_>>();
+            info!("Loaded {} claim token filters from database", individual_filters.len());
+            ScalableCuckooFilter::from_partial_and_filters(partial, individual_filters)
+        },
+        None => {
+            let mut filter: ScalableCuckooFilter<[u8; 32]> = ScalableCuckooFilter::new(2^8, 0.0001);
+            let first_filter = filter.grow();
+            store_filter(first_filter, 0, &db)?;
+            db.insert(b"FILTER", to_bytes::<_, 32>(&filter.to_partial()).unwrap().as_ref()).unwrap();
+            CHECKPOINT.clone().notified().await;
+            info!("Claim token filter created");
+            filter
+        }
+    };
+
+    let filter = web::Data::new(RwLock::new(filter));
+
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(db_getter.clone()))
-            .app_data(web::Data::new(secret.clone()))
-            .app_data(web::Data::new(public.clone()))
+            .app_data(db_getter.clone())
+            .app_data(secret.clone())
+            .app_data(public.clone())
+            .app_data(filter.clone())
             .service(kt2_public)
             .service(create_vote)
             .service(verify_eligibility)

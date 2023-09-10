@@ -1,3 +1,4 @@
+use tracing::info;
 use concilia::Client;
 use concilia_shared::{StringConversion, VoteID};
 
@@ -13,7 +14,7 @@ async fn main() {
             .await
             .unwrap(),
     };
-    println!("vote_id: {}", vote_id);
+    info!("vote_id: {}", vote_id);
     let vote = client.get_vote(&vote_id).await.unwrap();
 
     let mut handles = vec![];
@@ -21,9 +22,14 @@ async fn main() {
         let vote = vote.clone();
         let client = Client::new("http://localhost:8080");
         let handle = tokio::spawn(async move {
-            let opt = if i % 2 == 0 { "b" } else { "c" }.to_string();
+            let opt = match i % 3 {
+                0 => "a",
+                1 => "b",
+                2 => "c",
+                _ => unreachable!(),
+            };
             for _ in 0..10 {
-                client.submit_ballot(&vote, opt.clone()).await.unwrap();
+                client.submit_ballot(&vote, opt.to_string()).await.unwrap();
             }
         });
         handles.push(handle);
@@ -32,6 +38,5 @@ async fn main() {
         handle.await.unwrap();
     }
     let vote = client.get_vote(&vote_id).await.unwrap();
-    println!("vote_id: {}", vote_id);
-    println!("{}", vote);
+    info!("{}", vote);
 }

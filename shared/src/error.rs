@@ -16,7 +16,8 @@ pub enum Error {
     InvalidBallotOption,
     ReqwestError(reqwest::Error),
     BadBallotReceiptSignature,
-    BallotNotFound
+    BallotNotFound,
+    ClaimTokenProbablyUsed
 }
 
 impl Display for Error {
@@ -36,6 +37,7 @@ impl Display for Error {
             Error::ReqwestError(e) => write!(f, "reqwest error: {}", e),
             Error::BadBallotReceiptSignature => write!(f, "bad ballot receipt signature"),
             Error::BallotNotFound => write!(f, "ballot not found"),
+            Error::ClaimTokenProbablyUsed => write!(f, "claim token probably used"),
         }
     }
 }
@@ -77,6 +79,7 @@ impl ResponseError for Error {
             Error::ReqwestError(_) => unreachable!(),
             Error::BadBallotReceiptSignature => unreachable!(),
             Error::BallotNotFound => actix_web::http::StatusCode::NOT_FOUND,
+            Error::ClaimTokenProbablyUsed => actix_web::http::StatusCode::BAD_REQUEST,
         }
     }
 

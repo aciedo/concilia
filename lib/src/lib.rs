@@ -35,7 +35,8 @@ impl Client {
     
         let vote_id = VoteID::new(&vote);
         let options = Options::default();
-        let claim_token = b"12341234123412341234123412341234";
+        let claim_token: [u8; 32] = rand::random();
+        // let claim_token: [u8; 32] = *b"testtesttesttesttesttesttesttest";
         let vote_pk = RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(&vote.pk).unwrap());
         let blinding_result = vote_pk.blind(&mut rand::thread_rng(), claim_token, true, &options)?;
         let blind_msg = blinding_result.blind_msg.clone();
@@ -56,7 +57,7 @@ impl Client {
             token,
             opt,
             &blinding_result,
-            claim_token,
+            &claim_token,
             &options,
             &vote_pk,
         )?;
@@ -73,6 +74,9 @@ impl Client {
         let kt2_sig = {
             let vec = bs58::decode(&kt2_sig).into_vec().unwrap();
             let mut bytes = [0u8; SIGN_BYTES];
+            if vec.len() != bytes.len() {
+                return Err(Error::BadBallotReceiptSignature);
+            }
             bytes.copy_from_slice(&vec);
             kt2::Signature(bytes)
         };

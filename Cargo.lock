@@ -551,6 +551,7 @@ name = "concilia-server"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "ahash 0.8.3",
  "blake3",
  "blind-rsa-signatures",
  "bs58",
@@ -834,6 +835,7 @@ dependencies = [
  "concilia-shared",
  "rand 0.8.5",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
