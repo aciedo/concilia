@@ -4,7 +4,7 @@ use blind_rsa_signatures::SecretKey as RsaSecretKey;
 use rkyv::{from_bytes, to_bytes};
 use sled::{Db, InlineArray};
 use tokio::{task::spawn_blocking, sync::Notify};
-use tracing::trace;
+use tracing::{trace, info};
 
 use concilia_shared::{VoteID, Ballot, Error, Vote, BallotID};
 
@@ -14,6 +14,7 @@ pub fn store_filter(filter: &CuckooFilter, index: usize, db: &Db) -> Result<(), 
     let value = to_bytes::<_, 1024>(filter).map_err(|_| Error::SerializationError)?;
     trace!("updating cuckoo_filter_{} with size {}", index, value.len());
     db.insert([b"cuckoo_filter_".as_ref(), &index.to_be_bytes()].concat(), value.as_ref())?;
+    NEEDS_FLUSH.notify_waiters();
     Ok(())
 }
 
@@ -22,6 +23,7 @@ pub fn store_vote_sk(sk: &RsaSecretKey, vote_id: &VoteID, db: &Db) -> Result<(),
     let key = [b"sk_vote_", vote_id.as_ref()].concat();
     trace!("storing vote sk, size {}", sk.len());
     db.insert(key, sk)?;
+    NEEDS_FLUSH.notify_waiters();
     Ok(())
 }
 
@@ -42,6 +44,7 @@ pub fn store_vote(vote: &Vote, db: &Db) -> Result<VoteID, Error> {
     let value = to_bytes::<_, 512>(vote).map_err(|_| Error::SerializationError)?;
     trace!("storing vote {}, size {}", &vote_id, value.len());
     db.insert(key, value.as_ref())?;
+    NEEDS_FLUSH.notify_waiters();
     Ok(vote_id)
 }
 
@@ -55,6 +58,7 @@ pub fn store_ballot(ballot: &Ballot, ballot_id: &BallotID, vote_id: &VoteID, db:
     let value = to_bytes::<_, 512>(ballot).map_err(|_| Error::SerializationError)?;
     trace!("storing ballot {}, size {}", &ballot_id, value.len());
     db.insert(key, value.as_ref())?;
+    NEEDS_FLUSH.notify_waiters();
     Ok(())
 }
 
@@ -78,31 +82,43 @@ pub fn apply_ballot(vote_id: &VoteID, ballot: &Ballot, db: Db) -> Result<(), Err
         }
         None => None,
     })?;
+    NEEDS_FLUSH.notify_waiters();
     Ok(())
 }
 
 /// The CHECKPOINT notification is sent out after every successful disk flush
 pub static CHECKPOINT: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::const_new()));
 
-/// A background task that flushes to disk every 50ms
+/// The NEEDS_FLUSH notification is triggered when a flush is needed
+pub static NEEDS_FLUSH: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::const_new()));
+
+/// A background task that flushes to disk at least every 25ms, if a flush is needed
 pub struct Flusher {
-    notify: Arc<Notify>,
+    checkpoint: Arc<Notify>,
+    needs_flush: Arc<Notify>,
 }
 
 impl Flusher {
-    pub const fn new(notify: Arc<Notify>) -> Self {
-        Flusher { notify }
+    pub fn new() -> Self {
+        Flusher { 
+            checkpoint: CHECKPOINT.clone(),
+            needs_flush: NEEDS_FLUSH.clone() }
     }
 
-    pub fn run(&self, db: Db) {
+    pub async fn run(&self, db: Db) {
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            db.flush().unwrap();
-            self.notify.notify_waiters();
+            self.needs_flush.notified().await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let db_clone = db.clone();
+            tokio::task::spawn_blocking(move || {
+                db_clone.flush().unwrap();
+            }).await.unwrap();
+            info!("flushed db to disk");
+            self.checkpoint.notify_waiters();
         }
     }
 
     pub fn start(self, db: Db) {
-        std::thread::spawn(move || self.run(db));
+        tokio::task::spawn(async move { self.run(db).await });
     }
 }

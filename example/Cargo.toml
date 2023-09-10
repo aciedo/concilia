@@ -12,3 +12,4 @@ tracing-subscriber = "0.3.17"
 concilia-shared = { path = "../shared" }
 rand = "0.8.5"
 tracing = "0.1.37"
+futures-util = "0.3.28"

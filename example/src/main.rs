@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use tracing::info;
 use concilia::Client;
 use concilia_shared::{StringConversion, VoteID};
@@ -18,7 +19,7 @@ async fn main() {
     let vote = client.get_vote(&vote_id).await.unwrap();
 
     let mut handles = vec![];
-    for i in 0..50 {
+    for i in 0..100 {
         let vote = vote.clone();
         let client = Client::new("http://localhost:8080");
         let handle = tokio::spawn(async move {
@@ -28,15 +29,13 @@ async fn main() {
                 2 => "c",
                 _ => unreachable!(),
             };
-            for _ in 0..10 {
+            for _ in 0..5 {
                 client.submit_ballot(&vote, opt.to_string()).await.unwrap();
             }
         });
         handles.push(handle);
     }
-    for handle in handles {
-        handle.await.unwrap();
-    }
+    join_all(handles).await;
     let vote = client.get_vote(&vote_id).await.unwrap();
     info!("{}", vote);
 }

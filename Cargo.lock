@@ -833,6 +833,7 @@ version = "0.1.0"
 dependencies = [
  "concilia",
  "concilia-shared",
+ "futures-util",
  "rand 0.8.5",
  "tokio",
  "tracing",

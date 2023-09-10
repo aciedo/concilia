@@ -63,17 +63,19 @@ async fn main() -> Result<(), Error> {
     let (db_tx, mut db_rx) = mpsc::unbounded_channel::<oneshot::Sender<Db>>();
     tokio::spawn(async move {
         // `Db` is `Send + !Sync`, so this thread hands out `Db` instances to other threads
+        // each HTTP request gets its own `Db` instance
         let db = sled::Config::default()
             .flush_every_ms(None)
             .path("concilia.db")
             .open()
             .unwrap();
-        Flusher::new(CHECKPOINT.clone()).start(db.clone());
-        let mut pool_cache = Vec::with_capacity(100);
+        Flusher::new().start(db.clone());
+        // prefill the pool cache
+        let mut pool_cache = Vec::with_capacity(32);
         let mut available = 0;
 
         fn replenish(pool_cache: &mut Vec<Db>, available: &mut usize, db: &Db) {
-            let additional = 100 - *available;
+            let additional = 32 - *available;
             for _ in 0..additional {
                 pool_cache.push(db.clone());
             }
@@ -81,43 +83,37 @@ async fn main() -> Result<(), Error> {
         }
 
         replenish(&mut pool_cache, &mut available, &db);
-        loop {
-            match db_rx.try_recv() {
-                Ok(sender) => {
-                    let db = match pool_cache.pop() {
-                        Some(db) => db,
-                        None => {
-                            replenish(&mut pool_cache, &mut available, &db);
-                            pool_cache.pop().unwrap()
-                        }
-                    };
-                    available -= 1;
-                    sender.send(db).unwrap();
+        while let Some(sender) = db_rx.recv().await {
+            let db = match pool_cache.pop() {
+                Some(db) => db,
+                None => {
+                    replenish(&mut pool_cache, &mut available, &db);
+                    pool_cache.pop().unwrap()
                 }
-                Err(TryRecvError::Empty) => replenish(&mut pool_cache, &mut available, &db),
-                Err(TryRecvError::Disconnected) => break,
-            }
+            };
+            available -= 1;
+            let _ = sender.send(db);
         }
     });
     let secret = web::Data::new(secret);
     let public = web::Data::new(public);
     let db_getter = web::Data::new(DbGetter(db_tx));
 
+    // set up the claim token filter (prevents double ballot submission from a single blind sig)
     let db = db_getter.get().await;
-    
     let filter = match db.get(b"FILTER")? {
         Some(partial) => {
             let partial: PartialScalableCuckooFilter<[u8; 32]> = from_bytes(&partial).map_err(|_| Error::SerializationError)?;
             // search db for the individual filters
-            let individual_filters = db.scan_prefix(b"cuckoo_filter_").into_iter().map(|a| {
-                let (_, value) = a.unwrap();
-                // sled's iterators are big endian so thesse are already in the right order
-                from_bytes::<CuckooFilter>(&value).unwrap()
-            }).collect::<Vec<_>>();
+            // sled's iterators are big endian so thesse are already in the right order
+            let individual_filters = db.scan_prefix(b"cuckoo_filter_").into_iter()
+                .map(|a| from_bytes::<CuckooFilter>(&a.unwrap().1).unwrap())
+                .collect::<Vec<_>>();
             info!("Loaded {} claim token filters from database", individual_filters.len());
             ScalableCuckooFilter::from_partial_and_filters(partial, individual_filters)
         },
         None => {
+            // each filter can hold 256 items with a targeted false positive rate of 0.01%
             let mut filter: ScalableCuckooFilter<[u8; 32]> = ScalableCuckooFilter::new(2^8, 0.0001);
             let first_filter = filter.grow();
             store_filter(first_filter, 0, &db)?;
