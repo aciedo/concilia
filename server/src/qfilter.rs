@@ -1,25 +1,5 @@
 //! Approximate Membership Query Filter ([AMQ-Filter](https://en.wikipedia.org/wiki/Approximate_Membership_Query_Filter))
-//! based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
-//!
-//! This is a small and flexible general-purpose AMQ-Filter, it not only supports approximate membership testing like a bloom filter
-//! but also deletions, merging (not implemented), resizing and [serde](https://crates.io/crates/serde) serialization.
-//!
-//! ### Example
-//!
-//! ```rust
-//! let mut f = qfilter::Filter::new(1000000, 0.01);
-//! for i in 0..1000 {
-//!     f.insert(i).unwrap();
-//! }
-//! for i in 0..1000 {
-//!     assert!(f.contains(i));
-//! }
-//! ```
-//!
-//! ### Hasher
-//!
-//! The hashing algorithm used is [xxhash3](https://crates.io/crates/xxhash-rust)
-//! which offers both high performance and stability across platforms.
+//! based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963). It uses xxhash3 as the hash function.
 //!
 //! ### Filter size
 //!
@@ -57,15 +37,6 @@
 //! | 30.125 | 3.35e-09 |
 //! | 31.125 | 1.68e-09 |
 //! | 32.125 | 8.38e-10 |
-//!
-//! ### Legacy x86_64 CPUs support
-//!
-//! The implementation assumes the `popcnt` instruction (equivalent to `integer.count_ones()`) is present
-//! when compiling for x86_64 targets. This is theoretically not guaranteed as the instruction in only
-//! available on AMD/Intel CPUs released after 2007/2008. If that's not the case the Filter constructor will panic.
-//!
-//! Support for such legacy x86_64 CPUs can be optionally enabled with the `legacy_x86_64_support`
-//! which incurs a ~10% performance penalty.
 
 use std::{
     cmp::Ordering,
@@ -1984,33 +1955,6 @@ mod tests {
                 (0..).take(50_000).filter(|i| f.contains(i)).count() as f64 / 50_000.0;
             dbg!(f.max_error_ratio(), est_fp_rate);
             assert!(est_fp_rate <= f.max_error_ratio());
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_serde() {
-        for capacity in [100, 1000, 10000] {
-            for fp_ratio in [0.2, 0.1, 0.01, 0.001, 0.0001] {
-                let mut f = Filter::new(capacity, fp_ratio);
-                for i in 0..f.capacity() {
-                    f.insert(i).unwrap();
-                }
-
-                let ser = serde_cbor::to_vec(&f).unwrap();
-                dbg!(
-                    f.current_error_ratio(),
-                    f.max_error_ratio(),
-                    f.capacity(),
-                    f.len(),
-                    ser.len()
-                );
-
-                f = serde_cbor::from_slice(&ser).unwrap();
-                for i in 0..f.capacity() {
-                    f.contains(i);
-                }
-            }
         }
     }
 
