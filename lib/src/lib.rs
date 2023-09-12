@@ -35,8 +35,8 @@ impl Client {
     
         let vote_id = VoteID::new(&vote);
         let options = Options::default();
-        let claim_token: [u8; 32] = rand::random();
-        // let claim_token: [u8; 32] = *b"testtesttesttesttesttesttesttest";
+        // let claim_token: [u8; 32] = rand::random();
+        let claim_token: [u8; 32] = *b"testtesttesttesttesttesttesttest";
         let vote_pk = RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(&vote.pk).unwrap());
         let blinding_result = vote_pk.blind(&mut rand::thread_rng(), claim_token, true, &options)?;
         let blind_msg = blinding_result.blind_msg.clone();

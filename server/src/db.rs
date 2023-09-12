@@ -8,16 +8,6 @@ use tracing::{trace, info};
 
 use concilia_shared::{VoteID, Ballot, Error, Vote, BallotID};
 
-use crate::cuckoo::CuckooFilter;
-
-pub fn store_filter(filter: &CuckooFilter, index: usize, db: &Db) -> Result<(), Error> {
-    let value = to_bytes::<_, 1024>(filter).map_err(|_| Error::SerializationError)?;
-    trace!("updating cuckoo_filter_{} with size {}", index, value.len());
-    db.insert([b"cuckoo_filter_".as_ref(), &index.to_be_bytes()].concat(), value.as_ref())?;
-    NEEDS_FLUSH.notify_waiters();
-    Ok(())
-}
-
 pub fn store_vote_sk(sk: &RsaSecretKey, vote_id: &VoteID, db: &Db) -> Result<(), Error> {
     let sk = sk.to_der().unwrap();
     let key = [b"sk_vote_", vote_id.as_ref()].concat();
@@ -108,7 +98,9 @@ impl Flusher {
     pub async fn run(&self, db: Db) {
         loop {
             self.needs_flush.notified().await;
+            info!("flushing db to disk in 25ms");
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            info!("flushing db to disk");
             let db_clone = db.clone();
             tokio::task::spawn_blocking(move || {
                 db_clone.flush().unwrap();

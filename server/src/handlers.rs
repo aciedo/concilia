@@ -6,15 +6,14 @@ use blind_rsa_signatures::{
 use kt2::{PublicKey, SecretKey};
 use rkyv::{archived_root, from_bytes};
 use serde::Deserialize as De;
-use tokio::sync::RwLock;
-use tracing::trace;
+use tracing::{trace, info};
 
 use crate::{
     db::{
         apply_ballot, maybe_read_ballot, maybe_read_vote, maybe_read_vote_sk, store_ballot,
-        store_vote, store_vote_sk, CHECKPOINT, store_filter,
+        store_vote, store_vote_sk, CHECKPOINT,
     },
-    DbGetter, cuckoo::ScalableCuckooFilter,
+    DbGetter, qfilter::{ShardedFilter, Filter},
 };
 use concilia_shared::{
     Ballot, BallotID, BallotSig, BallotToken, Error, StringConversion, Vote, VoteID,
@@ -69,14 +68,11 @@ async fn submit_ballot(
     body: Json<(VoteID, Ballot, Option<[u8; 32]>, [u8; 32])>,
     db_tx: Data<DbGetter>,
     kt2_secret: Data<SecretKey>,
-    filter: Data<RwLock<ScalableCuckooFilter<[u8; 32]>>>
+    filter: Data<ShardedFilter>
 ) -> Result<impl Responder, Error> {
     let db = db_tx.get().await;
     // load options from body
     let (vote_id, mut ballot, msg_randomizer, claim_token) = body.0;
-    if filter.read().await.contains(&claim_token) {
-        return Err(Error::ClaimTokenProbablyUsed);
-    }
     
     let options = Options::default();
     // try read vote from db
@@ -110,15 +106,18 @@ async fn submit_ballot(
     let kt2_sig = kt2_secret.sign(&ballot_id.0).0.to_vec();
     let kt2_str = bs58::encode(&kt2_sig).into_string();
     ballot.sig = BallotSig::D3(kt2_sig);
-    let mut filter = filter.write().await;
-    for (filter, index) in filter.insert(&claim_token) {
-        store_filter(filter, index, &db)?;
+    let hash = Filter::hash(claim_token);
+    let mut shard = filter.lock_shard_mut(&hash).await;
+    if shard.contains(hash) {
+        return Err(Error::ClaimTokenProbablyUsed);
     }
-    drop(filter);
+    shard.insert(hash, &db)?;
+    drop(shard);
     store_ballot(&ballot, &ballot_id, &vote_id, &db)?;
     apply_ballot(&vote_id, &ballot, db.clone())?;
     CHECKPOINT.clone().notified().await;
     trace!("SERVER counted ballot");
+    info!("Successfully counted ballot {} with claim token {}", &ballot_id, bs58::encode(&claim_token).into_string());
     Ok(Json((ballot_id.as_string(), kt2_str)))
 }
 

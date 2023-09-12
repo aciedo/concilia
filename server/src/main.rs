@@ -4,23 +4,22 @@ use actix_web::{web, App, HttpServer};
 use blake3::hash;
 use concilia_shared::Error;
 use kt2::Keypair;
-use rkyv::{to_bytes, from_bytes};
 use sled::Db;
 use tokio::sync::{
-    mpsc::{self, error::TryRecvError},
-    oneshot, RwLock,
+    mpsc,
+    oneshot,
 };
 use tracing::info;
 
-mod cuckoo;
 mod db;
 mod handlers;
+mod qfilter;
 
 use db::*;
 
 use handlers::*;
 
-use crate::cuckoo::{ScalableCuckooFilter, PartialScalableCuckooFilter, CuckooFilter};
+use crate::qfilter::ShardedFilter;
 
 // 1. Create vote
 // 2. Voter authenticates themselves to receive a blinded signature signed by vote's secret key
@@ -101,30 +100,15 @@ async fn main() -> Result<(), Error> {
 
     // set up the claim token filter (prevents double ballot submission from a single blind sig)
     let db = db_getter.get().await;
-    let filter = match db.get(b"FILTER")? {
-        Some(partial) => {
-            let partial: PartialScalableCuckooFilter<[u8; 32]> = from_bytes(&partial).map_err(|_| Error::SerializationError)?;
-            // search db for the individual filters
-            // sled's iterators are big endian so thesse are already in the right order
-            let individual_filters = db.scan_prefix(b"cuckoo_filter_").into_iter()
-                .map(|a| from_bytes::<CuckooFilter>(&a.unwrap().1).unwrap())
-                .collect::<Vec<_>>();
-            info!("Loaded {} claim token filters from database", individual_filters.len());
-            ScalableCuckooFilter::from_partial_and_filters(partial, individual_filters)
-        },
-        None => {
-            // each filter can hold 256 items with a targeted false positive rate of 0.01%
-            let mut filter: ScalableCuckooFilter<[u8; 32]> = ScalableCuckooFilter::new(2^8, 0.0001);
-            let first_filter = filter.grow();
-            store_filter(first_filter, 0, &db)?;
-            db.insert(b"FILTER", to_bytes::<_, 32>(&filter.to_partial()).unwrap().as_ref()).unwrap();
-            CHECKPOINT.clone().notified().await;
-            info!("Claim token filter created");
-            filter
-        }
+    let filter = if db.contains_key(b"partial_sharded_filter")? {
+        ShardedFilter::recover_from_db(&db)?
+    } else {
+        let filter = ShardedFilter::new(512, 1f64 / 512f64);
+        filter.save_to_db(&db).await?;
+        filter
     };
 
-    let filter = web::Data::new(RwLock::new(filter));
+    let filter = web::Data::new(filter);
 
     HttpServer::new(move || {
         App::new()
