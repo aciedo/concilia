@@ -1,9 +1,9 @@
-use std::{fmt::{Formatter, Display, self}, ops::Deref};
+use std::{fmt::{Formatter, Display}, ops::Deref};
 
 use blake3::hash;
 use blind_rsa_signatures::{BlindSignature, BlindingResult, Options, PublicKey as RsaPublicKey};
 use rkyv::{Archive, Serialize, Deserialize};
-use serde::{Serialize as Ser, Deserialize as De, de::{Visitor, self}};
+use serde::{Serialize as Ser, Deserialize as De};
 
 use crate::{StringConversion, error::Error};
 
@@ -37,58 +37,11 @@ impl Display for BallotToken {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug)]
+#[derive(Archive, Serialize, Deserialize, Debug, Ser, De)]
 #[archive(check_bytes)]
 pub enum BallotSig {
-    D3(Vec<u8>),
-    Blind(Vec<u8>),
-}
-
-impl Ser for BallotSig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let (variant_byte, bytes) = match self {
-            BallotSig::D3(bytes) => (0u8, bytes),
-            BallotSig::Blind(bytes) => (1u8, bytes),
-        };
-        let mut vec = Vec::with_capacity(1usize + bytes.len());
-        vec.push(variant_byte);
-        vec.extend_from_slice(bytes);
-        let str = bs58::encode(&vec).into_string();
-        serializer.serialize_str(&str)
-    }
-}
-
-impl<'de> De<'de> for BallotSig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct BallotSigVisitor;
-        
-        impl<'de> Visitor<'de> for BallotSigVisitor {
-            type Value = BallotSig;
-        
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a base58 encoded string representing BallotSig")
-            }
-        
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                let vec = bs58::decode(v).into_vec().map_err(E::custom)?;
-        
-                let (variant_byte, bytes) = vec.split_at(1);
-                match variant_byte {
-                    [0u8] => Ok(BallotSig::D3(bytes.to_vec())),
-                    [1u8] => Ok(BallotSig::Blind(bytes.to_vec())),
-                    _ => Err(E::custom("Invalid variant byte")),
-                }
-            }
-        }
-        
-        deserializer.deserialize_str(BallotSigVisitor)
-    }
+    D3(#[serde(with = "serde_bytes")] Vec<u8>),
+    Blind(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 impl Deref for BallotSig {
@@ -168,4 +121,11 @@ impl Display for BallotID {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_string())
     }
+}
+
+#[derive(Archive, Serialize, Deserialize, Ser, De)]
+pub struct BallotSubmissionResponse {
+    #[serde(with = "serde_bytes")]
+    pub kt2_sig: Vec<u8>,
+    pub ballot_id: BallotID,
 }

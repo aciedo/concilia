@@ -103,7 +103,7 @@ async fn main() -> Result<(), Error> {
     let filter = if db.contains_key(b"partial_sharded_filter")? {
         ShardedFilter::recover_from_db(&db)?
     } else {
-        let filter = ShardedFilter::new(512, 1f64 / 512f64);
+        let filter = ShardedFilter::new(256, 1f64 / 512f64);
         filter.save_to_db(&db).await?;
         filter
     };

@@ -79,7 +79,7 @@ impl ResponseError for Error {
             Error::ReqwestError(_) => unreachable!(),
             Error::BadBallotReceiptSignature => unreachable!(),
             Error::BallotNotFound => actix_web::http::StatusCode::NOT_FOUND,
-            Error::ClaimTokenProbablyUsed => actix_web::http::StatusCode::BAD_REQUEST,
+            Error::ClaimTokenProbablyUsed => actix_web::http::StatusCode::CONFLICT,
         }
     }
 

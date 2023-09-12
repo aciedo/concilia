@@ -6,7 +6,7 @@ use blind_rsa_signatures::{
 use kt2::{PublicKey, SecretKey};
 use rkyv::{archived_root, from_bytes};
 use serde::Deserialize as De;
-use tracing::{trace, info};
+use tracing::debug;
 
 use crate::{
     db::{
@@ -16,7 +16,7 @@ use crate::{
     DbGetter, qfilter::{ShardedFilter, Filter},
 };
 use concilia_shared::{
-    Ballot, BallotID, BallotSig, BallotToken, Error, StringConversion, Vote, VoteID,
+    Ballot, BallotID, BallotSig, BallotToken, Error, StringConversion, Vote, VoteID, BallotSubmissionResponse,
 };
 
 #[get("/kt2_public")]
@@ -35,7 +35,7 @@ async fn create_vote(
     let vote_id = store_vote(&vote, &db)?;
     store_vote_sk(&sk, &vote_id, &db)?;
     CHECKPOINT.clone().notified().await;
-    trace!("SERVER vote created: {}", &vote_id);
+    debug!("SERVER vote created: {}", &vote_id);
     Ok(Json(vote_id.to_string()))
 }
 
@@ -50,13 +50,13 @@ async fn verify_eligibility(
     let options = Options::default();
     let rng = &mut rand::thread_rng();
     let blind_msg = BlindedMessage(blind_msg);
-    trace!("SERVER loading vote blinding secret key");
+    debug!("SERVER loading vote blinding secret key");
     let sk = maybe_read_vote_sk(&vote_id, db.clone())
         .await?
         .ok_or(Error::VoteNotFound)?;
     let sig = sk.blind_sign(rng, &blind_msg, &options)?;
     let token = BallotToken::new(sig);
-    trace!(
+    debug!(
         "SERVER issued ballot token: {}",
         bs58::encode(&token.blinded_sig).into_string()
     );
@@ -84,7 +84,7 @@ async fn submit_ballot(
 
     let ballot_id = BallotID::new(&ballot);
     let pk = RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(&vote.pk).unwrap());
-    trace!("SERVER validating blind signature");
+    debug!("SERVER validating blind signature");
 
     let sig = if let BallotSig::Blind(sig) = ballot.sig {
         sig
@@ -100,15 +100,16 @@ async fn submit_ballot(
         claim_token,
         &options,
     )?;
-    trace!("SERVER blind signature valid");
+    debug!("SERVER blind signature valid");
     // this is your "vote counted" receipt
     // we replace the blind sig with a D3 sig because PQ blind sigs are huge (22kb each) so we don't bother storing them
     let kt2_sig = kt2_secret.sign(&ballot_id.0).0.to_vec();
-    let kt2_str = bs58::encode(&kt2_sig).into_string();
-    ballot.sig = BallotSig::D3(kt2_sig);
+    ballot.sig = BallotSig::D3(kt2_sig.clone());
     let hash = Filter::hash(claim_token);
     let mut shard = filter.lock_shard_mut(&hash).await;
     if shard.contains(hash) {
+        // the filter is probabilistic so this could be a false positive
+        // no problem if so, client will just retry with a new token
         return Err(Error::ClaimTokenProbablyUsed);
     }
     shard.insert(hash, &db)?;
@@ -116,9 +117,8 @@ async fn submit_ballot(
     store_ballot(&ballot, &ballot_id, &vote_id, &db)?;
     apply_ballot(&vote_id, &ballot, db.clone())?;
     CHECKPOINT.clone().notified().await;
-    trace!("SERVER counted ballot");
-    info!("Successfully counted ballot {} with claim token {}", &ballot_id, bs58::encode(&claim_token).into_string());
-    Ok(Json((ballot_id.as_string(), kt2_str)))
+    debug!("SERVER counted ballot");
+    Ok(Json(BallotSubmissionResponse { ballot_id, kt2_sig }))
 }
 
 #[get("/votes")]

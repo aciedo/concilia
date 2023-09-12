@@ -19,7 +19,7 @@ async fn main() {
     let vote = client.get_vote(&vote_id).await.unwrap();
 
     let mut handles = vec![];
-    for i in 0..100 {
+    for i in 0..50 {
         let vote = vote.clone();
         let client = Client::new("http://localhost:8080");
         let handle = tokio::spawn(async move {
@@ -29,7 +29,7 @@ async fn main() {
                 2 => "c",
                 _ => unreachable!(),
             };
-            for _ in 0..5 {
+            for _ in 0..10 {
                 client.submit_ballot(&vote, opt.to_string()).await.unwrap();
             }
         });

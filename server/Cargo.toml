@@ -26,3 +26,4 @@ futures-util = "0.3.28"
 ahash = "0.8.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 arr_macro = "0.2.1"
+serde_bytes = "0.11.12"

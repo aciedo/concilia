@@ -49,7 +49,7 @@ use concilia_shared::Error;
 use rkyv::{from_bytes, to_bytes, Archive, Deserialize, Serialize};
 use sled::Db;
 use tokio::sync::{RwLock, RwLockWriteGuard, RwLockReadGuard};
-use tracing::trace;
+use tracing::{debug, info};
 
 use crate::db::NEEDS_FLUSH;
 
@@ -230,7 +230,7 @@ struct PartialFilterShard {
 
 impl PartialFilterShard {
     fn save_to_db(&self, db: &Db, shard_id: usize) -> Result<(), Error> {
-        trace!("Saving partial filter shard {}", shard_id);
+        debug!("Saving partial filter shard {}", shard_id);
         let value = to_bytes::<_, 1024>(self)
             .map_err(|_| Error::SerializationError)?;
         let key = [
@@ -355,7 +355,7 @@ impl ShardedFilter {
 
     pub fn recover_from_db(db: &Db) -> Result<Self, Error> {
         // load partial sharded filter from db
-        trace!("loading partial sharded filter");
+        debug!("loading partial sharded filter");
         let partial_sharded_filter: PartialShardedFilter = from_bytes(
             db.get(b"partial_sharded_filter")?
                 .expect("no partial sharded filter found in db")
@@ -363,10 +363,13 @@ impl ShardedFilter {
         )
         .map_err(|_| Error::SerializationError)?;
 
+        let mut total_filters = 0;
+        let mut total_capacity = 0;
+        let mut total_items = 0;
         // retrieve individual partial filter shards
         let shards = (0..256usize)
             .map(|shard_id| {
-                trace!("loading partial filter shard {}", shard_id);
+                debug!("loading partial filter shard {}", shard_id);
                 let key = [b"partial_filter_shard_", shard_id.to_be_bytes().as_ref()].concat();
                 let partial_filter_shard: PartialFilterShard = from_bytes(
                     db.get(key)?
@@ -380,7 +383,7 @@ impl ShardedFilter {
                 
                 let mut filters = Vec::with_capacity(partial_filter_shard.total_filters);
                 for filter_id in 0..partial_filter_shard.total_filters {
-                    trace!("loading filter {} for shard {}", filter_id, shard_id);
+                    debug!("loading filter {} for shard {}", filter_id, shard_id);
                     let key = [
                         b"filter_",
                         shard_id.to_be_bytes().as_ref(),
@@ -393,6 +396,7 @@ impl ShardedFilter {
                     ));
                     filters.push(from_bytes(value.as_ref())
                         .map_err(|_| Error::SerializationError)?);
+                    total_filters += 1;
                 }
                 let shard = FilterShard {
                     filters,
@@ -401,6 +405,9 @@ impl ShardedFilter {
                     target_fp_rate: partial_sharded_filter.target_fp_rate,
                     next_writable_filter: partial_filter_shard.next_writable_filter,
                 };
+                
+                total_capacity += shard.capacity;
+                total_items += shard.len();
                 Ok(RwLock::new(shard))
             })
             .collect::<Result<Vec<RwLock<FilterShard>>, Error>>()?;
@@ -408,6 +415,8 @@ impl ShardedFilter {
         if shards.len() != 256 {
             panic!("shards were missing from db")
         }
+        
+        info!("Loaded {} filter shards with {} filters, {} items and {} active capacity", shards.len(), total_filters, total_items, total_capacity);
         
         // return sharded filter
         Ok(Self {
@@ -434,7 +443,7 @@ pub struct PartialShardedFilter {
 
 impl PartialShardedFilter {
     pub fn save_to_db(&self, db: &Db) -> Result<(), Error> {
-        trace!("Saving partial sharded filter");
+        debug!("Saving partial sharded filter");
         let value = to_bytes::<_, 1024>(self).map_err(|_| Error::SerializationError)?;
         db.insert(b"partial_sharded_filter", value.as_ref())?;
         Ok(())
@@ -449,7 +458,6 @@ pub struct Filter {
     len: u64,
     qbits: NonZeroU8,
     rbits: NonZeroU8,
-    max_qbits: Option<NonZeroU8>,
 }
 
 #[derive(Debug)]
@@ -655,57 +663,6 @@ impl CastNonZeroU8 for NonZeroU8 {
     }
 }
 
-struct HashesIter<'a> {
-    filter: &'a Filter,
-    q_bucket_idx: u64,
-    r_bucket_idx: u64,
-    remaining: u64,
-}
-
-impl<'a> HashesIter<'a> {
-    fn new(filter: &'a Filter) -> Self {
-        let mut iter = HashesIter {
-            filter,
-            q_bucket_idx: 0,
-            r_bucket_idx: 0,
-            remaining: filter.len,
-        };
-        if !filter.is_empty() {
-            while !filter.is_occupied(iter.q_bucket_idx) {
-                iter.q_bucket_idx += 1;
-            }
-            iter.r_bucket_idx = filter.run_start(iter.q_bucket_idx);
-        }
-        iter
-    }
-}
-
-impl Iterator for HashesIter<'_> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(r) = self.remaining.checked_sub(1) {
-            self.remaining = r;
-        } else {
-            return None;
-        }
-        let hash = (self.q_bucket_idx << self.filter.rbits.get())
-            | self.filter.get_remainder(self.r_bucket_idx);
-
-        if self.filter.is_runend(self.r_bucket_idx) {
-            self.q_bucket_idx += 1;
-            while !self.filter.is_occupied(self.q_bucket_idx) {
-                self.q_bucket_idx += 1;
-            }
-            self.r_bucket_idx = (self.r_bucket_idx + 1).max(self.q_bucket_idx);
-        } else {
-            self.r_bucket_idx += 1;
-        }
-
-        Some(hash)
-    }
-}
-
 impl Filter {
     /// Creates a new filter that can hold at least `capacity` items
     /// and with a desired error rate of `fp_rate` (clamped to (0, 0.5]).
@@ -713,42 +670,16 @@ impl Filter {
     /// # Panics
     /// Panics if memory cannot be allocated or if capacity >= u64::MAX / 20.
     /// Panics if the capacity and false positive rate isn't achievable using 64 bit hashes.
-    #[inline]
     pub fn new(capacity: u64, fp_rate: f64) -> Self {
-        Self::new_resizeable(capacity, capacity, fp_rate)
-    }
-
-    /// Creates a new filter that can hold at least `initial_capacity` items initially
-    /// and can resize to hold at least `max_capacity` when fully grown.
-    /// The desired error rate `fp_rate` (clamped to (0, 0.5]) applies to the fully grown filter.
-    ///
-    /// This works by storing fingerprints large enough to satisfy the maximum requirements,
-    /// so smaller filters will actually have lower error rates, which will increase
-    /// (up to `fp_rate`) as the filter grows. In practice every time the filter doubles in
-    /// capacity its error rate also doubles.
-    ///
-    /// # Panics
-    /// Panics if memory cannot be allocated or if capacity >= u64::MAX / 20.
-    /// Panics if the max capacity and false positive rate isn't achievable using 64 bit hashes.
-    pub fn new_resizeable(initial_capacity: u64, max_capacity: u64, fp_rate: f64) -> Self {
-        assert!(max_capacity >= initial_capacity);
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
         // Calculate necessary slots to achieve capacity with up to 95% occupancy
         // 19/20 == 0.95
-        let max_qbits = (max_capacity.checked_mul(20).expect("Capacity overflow") / 19)
+        let qbits = (capacity * 20 / 19)
             .next_power_of_two()
             .max(64)
             .trailing_zeros() as u8;
-        let qbits = (initial_capacity * 20 / 19)
-            .next_power_of_two()
-            .max(64)
-            .trailing_zeros() as u8;
-        let rbits = (-fp_rate.log2()).round().max(1.0) as u8 + (max_qbits - qbits);
-        let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap());
-        if max_qbits > qbits {
-            result.max_qbits = Some(max_qbits.try_into().unwrap());
-        }
-        result
+        let rbits = (-fp_rate.log2()).round().max(1.0) as u8;
+        Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())
     }
 
     fn with_qr(qbits: NonZeroU8, rbits: NonZeroU8) -> Filter {
@@ -768,7 +699,6 @@ impl Filter {
             qbits,
             rbits,
             len: 0,
-            max_qbits: None,
         }
     }
 
@@ -802,13 +732,6 @@ impl Filter {
         self.len = 0;
     }
 
-    /// Maximum filter capacity.
-    #[inline]
-    pub fn capacity_resizeable(&self) -> u64 {
-        // Overflow is not possible here as it'd have overflowed in the constructor.
-        (1 << self.max_qbits.unwrap_or(self.qbits).get()) * 19 / 20
-    }
-
     /// Current filter capacity.
     #[inline]
     pub fn capacity(&self) -> u64 {
@@ -822,12 +745,6 @@ impl Filter {
             // Overflow is not possible here as it'd have overflowed in the constructor.
             self.total_buckets().get() * 19 / 20
         }
-    }
-
-    /// Max error ratio when at the resizeable capacity (len == resizeable_capacity).
-    pub fn max_error_ratio_resizeable(&self) -> f64 {
-        let extra_rbits = self.max_qbits.unwrap_or(self.qbits).get() - self.qbits.get();
-        2f64.powi(-((self.rbits.get() - extra_rbits) as i32))
     }
 
     /// Max error ratio when at full capacity (len == capacity).
@@ -1416,13 +1333,7 @@ impl Filter {
     /// and the item is known to not have been added to the filter before (or was removed).
     pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), QError> {
         let hash = Self::hash(item);
-        match self.do_insert(true, hash) {
-            Ok(_added) => Ok(()),
-            Err(QError::CapacityExceeded) => {
-                self.grow_if_possible()?;
-                self.do_insert(true, hash).map(|_| ())
-            }
-        }
+        self.do_insert(true, hash).map(|_| ())
     }
 
     /// Inserts `item` in the filter.
@@ -1431,13 +1342,7 @@ impl Filter {
     /// Returns an error if the filter cannot admit the new item.
     pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, QError> {
         let hash = Self::hash(item);
-        match self.do_insert(false, hash) {
-            Ok(added) => Ok(added),
-            Err(_) => {
-                self.grow_if_possible()?;
-                self.do_insert(true, hash)
-            }
-        }
+        self.do_insert(false, hash)
     }
 
     fn do_insert(&mut self, duplicate: bool, hash: u64) -> Result<bool, QError> {
@@ -1524,31 +1429,6 @@ impl Filter {
     }
 
     #[inline]
-    fn grow_if_possible(&mut self) -> Result<(), QError> {
-        if let Some(m) = self.max_qbits {
-            if m > self.qbits {
-                self.grow();
-                return Ok(());
-            }
-        }
-        Err(QError::CapacityExceeded)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self) {
-        let qbits = self.qbits.checked_add(1).unwrap();
-        let rbits = NonZeroU8::new(self.rbits.get() - 1).unwrap();
-        let mut new = Self::with_qr(qbits, rbits);
-        new.max_qbits = self.max_qbits;
-        for hash in HashesIter::new(self) {
-            new.do_insert(true, hash).unwrap();
-        }
-        assert_eq!(self.len, new.len);
-        *self = new;
-    }
-
-    #[inline]
     pub fn hash<T: Hash>(item: T) -> u64 {
         let mut hasher = StableHasher::new();
         item.hash(&mut hasher);
@@ -1618,7 +1498,7 @@ impl Filter {
     }
     
     fn save_to_db(&self, db: &Db, shard_id: usize, filter_id: usize) -> Result<(), Error> {
-        trace!("Saving filter {} of shard {} to disk", filter_id, shard_id);
+        debug!("Saving filter {} of shard {} to disk", filter_id, shard_id);
         let value = to_bytes::<_, 1024>(self).map_err(|_| Error::SerializationError)?;
         let key = [
             b"filter_",
@@ -1638,7 +1518,6 @@ impl std::fmt::Debug for Filter {
             .field("len", &self.len)
             .field("qbits", &self.qbits)
             .field("rbits", &self.rbits)
-            .field("max_qbits", &self.max_qbits)
             .finish()
     }
 }
@@ -1784,54 +1663,15 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_resize_two() {
-        let mut f = Filter::new_resizeable(50, 1000, 0.01);
-        for _ in 0..50 {
-            f.insert_duplicated(0).unwrap();
-        }
-        for _ in 0..3 {
-            f.insert_duplicated(1).unwrap();
-        }
-        f.grow();
-        f.grow();
-        f.grow();
-        assert_eq!(f.count(0), 50);
-        assert_eq!(f.count(1), 3);
-    }
-
-    #[test]
-    fn test_new_resizeable() {
-        let mut f = Filter::new_resizeable(100, 100, 0.01);
-        assert!(f.grow_if_possible().is_err());
-        let mut f = Filter::new_resizeable(0, 100, 0.01);
-        assert!(f.grow_if_possible().is_ok());
-    }
-
-    #[test]
     #[should_panic]
     fn test_new_capacity_overflow() {
-        Filter::new_resizeable(100, u64::MAX, 0.01);
+        Filter::new(u64::MAX, 0.01);
     }
 
     #[test]
     #[should_panic]
     fn test_new_hash_overflow() {
-        Filter::new_resizeable(100, u64::MAX / 20, 0.01);
-    }
-
-    #[test]
-    fn test_auto_resize_one() {
-        let mut f = Filter::new_resizeable(100, 500, 0.01);
-        for i in 0u64.. {
-            if f.insert_duplicated(i).is_err() {
-                assert_eq!(f.len(), i);
-                break;
-            }
-        }
-        assert!(f.len() >= 500);
-        for i in 0u64..f.len() {
-            assert!(f.contains(i), "{}", i);
-        }
+        Filter::new(u64::MAX / 20, 0.01);
     }
 
     #[test]

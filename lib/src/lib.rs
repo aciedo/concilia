@@ -2,8 +2,9 @@ use blind_rsa_signatures::{
     reexports::rsa::{self, pkcs8::DecodePublicKey},
     Options, PublicKey as RsaPublicKey,
 };
-use concilia_shared::{Ballot, BallotID, BallotToken, Error, StringConversion, Vote, VoteID};
+use concilia_shared::{Ballot, BallotID, BallotToken, Error, StringConversion, Vote, VoteID, BallotSubmissionResponse};
 use kt2::{PublicKey, SIGN_BYTES};
+use async_recursion::async_recursion;
 
 pub struct Client {
     client: reqwest::Client,
@@ -18,6 +19,7 @@ impl Client {
         }
     }
     
+    #[async_recursion]
     pub async fn submit_ballot(&self, vote: &Vote, opt: String) -> Result<BallotID, Error> {
         // 2. VOTER authenticates themselves to receive a blinded signature signed by vote's secret key
         // This would usually include some sort of ID check. Personal info is okay-ish to hand over
@@ -35,8 +37,8 @@ impl Client {
     
         let vote_id = VoteID::new(&vote);
         let options = Options::default();
-        // let claim_token: [u8; 32] = rand::random();
-        let claim_token: [u8; 32] = *b"testtesttesttesttesttesttesttest";
+        let claim_token: [u8; 32] = rand::random();
+        // let claim_token: [u8; 32] = *b"testtesttesttesttesttesttesttest";
         let vote_pk = RsaPublicKey::from(rsa::RsaPublicKey::from_public_key_der(&vote.pk).unwrap());
         let blinding_result = vote_pk.blind(&mut rand::thread_rng(), claim_token, true, &options)?;
         let blind_msg = blinding_result.blind_msg.clone();
@@ -55,7 +57,7 @@ impl Client {
         // VOTER
         let ballot = Ballot::from_token(
             token,
-            opt,
+            opt.clone(),
             &blinding_result,
             &claim_token,
             &options,
@@ -69,17 +71,17 @@ impl Client {
             .json(&body)
             .send()
             .await?;
-        let (ballot_id, kt2_sig) = res.json::<(String, String)>().await?;
-        let ballot_id = BallotID::from_string(ballot_id).ok_or(Error::SerializationError)?;
-        let kt2_sig = {
-            let vec = bs58::decode(&kt2_sig).into_vec().unwrap();
-            let mut bytes = [0u8; SIGN_BYTES];
-            if vec.len() != bytes.len() {
-                return Err(Error::BadBallotReceiptSignature);
-            }
-            bytes.copy_from_slice(&vec);
-            kt2::Signature(bytes)
-        };
+        // the server MAY refuse this claim token due to how it checks for duplicates
+        // this is not a problem, we just try again. the targeted error rate is about 0.2%
+        if res.status() == 409 {
+            return self.submit_ballot(vote, opt).await
+        }
+        let BallotSubmissionResponse { ballot_id, kt2_sig } = res.json::<BallotSubmissionResponse>().await?;
+        let kt2_sig = kt2::Signature({
+            let mut bytes = [0; SIGN_BYTES];
+            bytes.copy_from_slice(&kt2_sig);
+            bytes
+        });
         if !pk.verify(&ballot_id.0, &kt2_sig) {
             return Err(Error::BadBallotReceiptSignature);
         }
